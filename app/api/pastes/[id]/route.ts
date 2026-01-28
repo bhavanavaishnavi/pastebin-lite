@@ -1,49 +1,42 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { kv } from "../../../../lib/kv";
 
-type Paste = {
-  content: string;
-  created_at: number;
-  ttl_seconds?: number;
-  max_views?: number;
-  views: number;
-};
-
 export async function GET(
-  request: NextRequest,
-  context: { params: Promise<{ id: string }> }
+  req: Request,
+  context: { params: { id: string } | Promise<{ id: string }> }
 ) {
-  const { id } = await context.params;
+  // Unwrap params if it's a promise
+  const { id } = "then" in context.params ? await context.params : context.params;
 
-  const paste = await kv.get<Paste>(`paste:${id}`);
+  if (!id) {
+    return NextResponse.json({ error: "Missing paste id" }, { status: 400 });
+  }
 
-  if (!paste) {
+  // Fetch paste from Redis
+  const pasteStr = await kv.get<string>(`paste:${id}`);
+  if (!pasteStr) {
     return NextResponse.json({ error: "Paste not found" }, { status: 404 });
   }
 
-  // TTL check
-  if (paste.ttl_seconds) {
-    const expired = paste.created_at + paste.ttl_seconds * 1000 < Date.now();
-    if (expired) {
-      await kv.del(`paste:${id}`);
-      return NextResponse.json({ error: "Paste expired" }, { status: 410 });
-    }
+  const paste = JSON.parse(pasteStr);
+
+  // Check TTL
+  if (paste.ttl_seconds && Date.now() > paste.created_at + paste.ttl_seconds * 1000) {
+    return NextResponse.json({ error: "Paste expired" }, { status: 404 });
   }
 
-  // Max views check
+  // Check max views
   if (paste.max_views && paste.views >= paste.max_views) {
-    await kv.del(`paste:${id}`);
-    return NextResponse.json({ error: "Paste view limit reached" }, { status: 410 });
+    return NextResponse.json({ error: "Paste view limit exceeded" }, { status: 404 });
   }
 
+  // Increment views
   paste.views++;
-  await kv.set(`paste:${id}`, paste);
+  await kv.set(`paste:${id}`, JSON.stringify(paste));
 
   return NextResponse.json({
     content: paste.content,
     remaining_views: paste.max_views ? paste.max_views - paste.views : null,
-    expires_at: paste.ttl_seconds
-      ? new Date(paste.created_at + paste.ttl_seconds * 1000).toISOString()
-      : null,
+    expires_at: paste.ttl_seconds ? new Date(paste.created_at + paste.ttl_seconds * 1000).toISOString() : null
   });
 }
